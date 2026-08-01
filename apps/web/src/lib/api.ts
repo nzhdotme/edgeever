@@ -207,7 +207,7 @@ const isDesktopAuthenticationRequest = (path: string) =>
 
 const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const headers = new Headers(init?.headers);
-  const isDesktop = Boolean(window.edgeeverDesktop?.isAvailable);
+  const isDesktop = Boolean(typeof window !== "undefined" && window.edgeeverDesktop?.isAvailable);
   const sessionToken = isDesktop ? getCachedDesktopSession()?.sessionToken : undefined;
 
   if (isDesktop && desktopSessionRejected && !isDesktopAuthenticationRequest(path)) {

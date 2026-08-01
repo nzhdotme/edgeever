@@ -6,6 +6,7 @@ const events = [];
 let completeSave;
 
 globalThis.window = {
+  location: { hostname: "notes.example.com", origin: "https://notes.example.com" },
   edgeeverDesktop: {
     isAvailable: true,
     apiBaseUrl: "",
