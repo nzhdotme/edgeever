@@ -101,10 +101,10 @@ import {
 import { AccountSecurityPanel } from "./AccountSecurityModal";
 import { beginEditorStartup, markStartup, recordEditorStartup } from "../lib/startup-performance";
 import { prepareUploadAsset } from "../lib/mobile-image-upload";
-import EditorRuntimePrewarm from "../components/EditorRuntimePrewarm";
 import MobileWebClipCapture from "../components/MobileWebClipCapture";
 import { showEdgeEverKeyboard } from "../../modules/edgeever-keyboard";
 import LocalTiptapEditor, { type LocalTiptapEditorRef } from "../components/LocalTiptapEditor";
+import { MobileResourceActions } from "../components/MobileResourceActions";
 import { resolveMobileThemeStyles, useMobileTheme } from "../lib/mobile-theme";
 import { useMobileUpdate } from "../lib/mobile-update";
 import { MobileMermaidDiagram, MobileMermaidProvider } from "../components/MobileMermaid";
@@ -147,6 +147,15 @@ import { refreshWorkspaceThemeStyles, styles } from "./workspace-styles";
 import { NotesView } from "./WorkspaceNotesView";
 import { SettingsView, type MobileLocaleMode } from "./WorkspaceSettingsView";
 import { MemoDetailModal } from "./WorkspaceMemoDetail";
+import {
+  deleteMobileResourceFromDoc,
+  getMobileResourceUpdatePayload,
+  openMobileResource,
+  parseMobileResourceTargetJson,
+  renameMobileResourceInDoc,
+  saveMobileResourceAs,
+  type MobileResourceTarget,
+} from "../lib/mobile-attachments";
 
 const ALL_NOTES_ID = "all";
 const DEFAULT_MEMO_TITLE = "无标题笔记";
@@ -175,7 +184,7 @@ export const WorkspaceScreen = ({
   onIncomingShareHandled?: () => void;
 }) => {
   const { resolvedTheme } = useMobileTheme();
-  const { preference: localePreference, setPreference: setLocalePreference } = useMobileLocale();
+  const { preference: localePreference, resolvedLocale, setPreference: setLocalePreference } = useMobileLocale();
   refreshWorkspaceThemeStyles(resolvedTheme);
   const { client, session, signOut } = useSession();
   const queryClient = useQueryClient();
@@ -199,7 +208,6 @@ export const WorkspaceScreen = ({
   const [notesActionsOpen, setNotesActionsOpen] = useState(false);
   const [notebookPickerOpen, setNotebookPickerOpen] = useState(false);
   const [richEditingSession, setRichEditingSession] = useState<RichEditingSession | null>(null);
-  const [editorRuntimeWarm, setEditorRuntimeWarm] = useState(false);
   const [revisionMemo, setRevisionMemo] = useState<MemoDetail | null>(null);
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedMemoIds, setSelectedMemoIds] = useState<Set<string>>(() => new Set());
@@ -338,26 +346,6 @@ export const WorkspaceScreen = ({
     const task = InteractionManager.runAfterInteractions(() => markStartup("workspace-interactive"));
     return () => task.cancel();
   }, []);
-
-  useEffect(() => {
-    if (!notebooksQuery.data || !memosQuery.data || editorRuntimeWarm) {
-      return;
-    }
-
-    let timeout: ReturnType<typeof setTimeout> | null = null;
-    const task = InteractionManager.runAfterInteractions(() => {
-      // Keep first-screen work isolated from Chromium/WebKit startup. A short
-      // idle window is still early enough to finish before a normal edit flow.
-      timeout = setTimeout(() => setEditorRuntimeWarm(true), 600);
-    });
-
-    return () => {
-      task.cancel();
-      if (timeout) {
-        clearTimeout(timeout);
-      }
-    };
-  }, [editorRuntimeWarm, memosQuery.data, notebooksQuery.data]);
 
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
@@ -915,6 +903,31 @@ export const WorkspaceScreen = ({
     ]);
   };
 
+  const handleRenameResource = async (memo: MemoDetail, target: MobileResourceTarget, filename: string) => {
+    if (!client) throw new Error("当前无法连接实例，请稍后重试");
+    const { resource } = await client.renameResource(target.resourceId, filename);
+    const contentJson = renameMobileResourceInDoc(
+      memo.contentJson,
+      target,
+      resource.filename || filename,
+      resolvedLocale === "en-US" ? "Attachment: " : "附件："
+    );
+    await localUpdateMemoMutation.mutateAsync({
+      memo,
+      payload: getMobileResourceUpdatePayload(contentJson),
+    });
+  };
+
+  const handleDeleteResource = async (memo: MemoDetail, target: MobileResourceTarget) => {
+    if (!client) throw new Error("当前无法连接实例，请稍后重试");
+    await client.deleteResource(target.resourceId);
+    const contentJson = deleteMobileResourceFromDoc(memo.contentJson, target);
+    await localUpdateMemoMutation.mutateAsync({
+      memo,
+      payload: getMobileResourceUpdatePayload(contentJson),
+    });
+  };
+
   const handleMemoSyncConflict = (memo: MemoDetail) => {
     Alert.alert(
       "同步冲突",
@@ -1061,8 +1074,10 @@ export const WorkspaceScreen = ({
         notebookName={notebooks.find((notebook) => notebook.id === selectedMemo?.notebookId)?.name ?? "未分类"}
         onClose={closeDetail}
         onDelete={handleDeleteMemo}
+        onDeleteResource={handleDeleteResource}
         onRichEdit={(memo) => void openRichEditor(memo)}
         onOpenRevisions={setRevisionMemo}
+        onRenameResource={handleRenameResource}
         onResolveSyncConflict={handleMemoSyncConflict}
         onRestore={(memo) => restoreMemoMutation.mutate(memo)}
         onShare={(memo) => shareMemoMutation.mutate(memo)}
@@ -1070,16 +1085,6 @@ export const WorkspaceScreen = ({
         visible={Boolean(selectedMemoId)}
       />
 
-      {editorRuntimeWarm ? (
-        <EditorRuntimePrewarm
-          dom={{
-            bounces: false,
-            containerStyle: styles.editorRuntimePrewarm,
-            scrollEnabled: false,
-            style: styles.editorRuntimePrewarm,
-          }}
-        />
-      ) : null}
       {notebookPickerOpen ? <NotebookPickerModal
         activeNotebookId={activeNotebookId}
         notebooks={notebooks}
@@ -1583,6 +1588,7 @@ const CreateMemoModal = ({
   const [dirty, setDirty] = useState(false);
   const [editorReady, setEditorReady] = useState(false);
   const [imageOperation, setImageOperation] = useState<"idle" | "creating" | "uploading">("idle");
+  const [resourceTarget, setResourceTarget] = useState<MobileResourceTarget | null>(null);
   const targetNotebookId = notebookId || fallbackNotebookId;
   const selectedNotebookName = notebooks.find((notebook) => notebook.id === targetNotebookId)?.name ?? "选择笔记本";
   const titleRef = useRef(title);
@@ -1875,6 +1881,33 @@ const CreateMemoModal = ({
     return pending;
   }, [client]);
 
+  const downloadResource = useCallback(async (target: MobileResourceTarget) => {
+    if (!client) throw new Error(resolvedLocale === "en-US" ? "The attachment client is unavailable." : "当前无法读取附件。");
+    await openMobileResource(client, target);
+  }, [client, resolvedLocale]);
+
+  const saveResourceAs = useCallback(async (target: MobileResourceTarget) => {
+    if (!client) throw new Error(resolvedLocale === "en-US" ? "The resource client is unavailable." : "当前无法读取资源。");
+    await saveMobileResourceAs(client, target);
+  }, [client, resolvedLocale]);
+
+  const renameResource = useCallback(async (target: MobileResourceTarget, filename: string) => {
+    if (!client || !materializedMemoRef.current) throw new Error(resolvedLocale === "en-US" ? "Wait for this note to sync first." : "请等待笔记同步完成。");
+    const { resource } = await client.renameResource(target.resourceId, filename);
+    editorRef.current?.renameResource(JSON.stringify(target), resource.filename || filename);
+  }, [client, resolvedLocale]);
+
+  const deleteResource = useCallback(async (target: MobileResourceTarget) => {
+    if (!client || !materializedMemoRef.current) throw new Error(resolvedLocale === "en-US" ? "Wait for this note to sync first." : "请等待笔记同步完成。");
+    await client.deleteResource(target.resourceId);
+    editorRef.current?.removeResource(JSON.stringify(target));
+  }, [client, resolvedLocale]);
+
+  const selectResource = useCallback(async (targetJson: string) => {
+    const target = parseMobileResourceTargetJson(targetJson);
+    if (target) setResourceTarget(target);
+  }, []);
+
   const editorElement = useMemo(() => draftLoaded && baseUrl ? (
     <LocalTiptapEditor
       autoFocus
@@ -1896,6 +1929,7 @@ const CreateMemoModal = ({
         flushResolverRef.current?.();
         flushResolverRef.current = null;
       }}
+      onResourcePress={selectResource}
       onLoadResource={loadEditorResource}
       onPickImage={pickAndUploadImage}
       onReady={async (elapsedMs) => {
@@ -1909,7 +1943,7 @@ const CreateMemoModal = ({
       locale={resolvedLocale}
       theme={resolvedTheme}
     />
-  ) : null, [baseUrl, draftLoaded, loadEditorResource, resolvedLocale, resolvedTheme]);
+  ) : null, [baseUrl, draftLoaded, loadEditorResource, resolvedLocale, resolvedTheme, selectResource]);
 
   return (
     <Modal animationType="slide" onRequestClose={() => void requestClose()} presentationStyle="fullScreen" visible={visible}>
@@ -1990,6 +2024,15 @@ const CreateMemoModal = ({
             markDirty();
           }}
           visible={notebookPickerOpen}
+        />
+        <MobileResourceActions
+          canMutate={Boolean(materializedMemoRef.current)}
+          onClose={() => setResourceTarget(null)}
+          onDelete={deleteResource}
+          onDownload={downloadResource}
+          onRename={renameResource}
+          onSaveAs={saveResourceAs}
+          target={resourceTarget}
         />
       </SafeAreaView>
     </Modal>
@@ -2195,6 +2238,7 @@ const RichEditorModal = ({
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [startupMs, setStartupMs] = useState<number | null>(null);
+  const [resourceTarget, setResourceTarget] = useState<MobileResourceTarget | null>(null);
   const notebookLabel = notebooks.find((notebook) => notebook.id === notebookId)?.name ?? "未分类";
   const saveLabel = error ? "保存失败" : saving ? "保存中" : uploading ? "上传中" : dirty ? (draftRestored ? "本地草稿" : "未保存") : ready ? "已保存" : "加载中";
   const titleRef = useRef(title);
@@ -2383,6 +2427,33 @@ const RichEditorModal = ({
     return pending;
   }, [client]);
 
+  const downloadResource = useCallback(async (target: MobileResourceTarget) => {
+    if (!client) throw new Error(resolvedLocale === "en-US" ? "The attachment client is unavailable." : "当前无法读取附件。");
+    await openMobileResource(client, target);
+  }, [client, resolvedLocale]);
+
+  const saveResourceAs = useCallback(async (target: MobileResourceTarget) => {
+    if (!client) throw new Error(resolvedLocale === "en-US" ? "The resource client is unavailable." : "当前无法读取资源。");
+    await saveMobileResourceAs(client, target);
+  }, [client, resolvedLocale]);
+
+  const renameResource = useCallback(async (target: MobileResourceTarget, filename: string) => {
+    if (!client || !memo || memo.id.startsWith("local:")) throw new Error(resolvedLocale === "en-US" ? "Wait for this note to sync first." : "请等待笔记同步完成。");
+    const { resource } = await client.renameResource(target.resourceId, filename);
+    editorRef.current?.renameResource(JSON.stringify(target), resource.filename || filename);
+  }, [client, memo, resolvedLocale]);
+
+  const deleteResource = useCallback(async (target: MobileResourceTarget) => {
+    if (!client || !memo || memo.id.startsWith("local:")) throw new Error(resolvedLocale === "en-US" ? "Wait for this note to sync first." : "请等待笔记同步完成。");
+    await client.deleteResource(target.resourceId);
+    editorRef.current?.removeResource(JSON.stringify(target));
+  }, [client, memo, resolvedLocale]);
+
+  const selectResource = useCallback(async (targetJson: string) => {
+    const target = parseMobileResourceTargetJson(targetJson);
+    if (target) setResourceTarget(target);
+  }, []);
+
   const editorElement = useMemo(
     () => memo && baseUrl ? (
       <LocalTiptapEditor
@@ -2397,6 +2468,7 @@ const RichEditorModal = ({
           style: styles.richEditorWebView,
         }}
         onChange={persistDraft}
+        onResourcePress={selectResource}
         onLoadResource={loadEditorResource}
         onPickImage={pickAndUploadImage}
         onReady={async (elapsedMs) => {
@@ -2419,7 +2491,7 @@ const RichEditorModal = ({
         theme={resolvedTheme}
       />
     ) : null,
-    [baseUrl, loadEditorResource, memo?.id, resolvedLocale, resolvedTheme]
+    [baseUrl, loadEditorResource, memo?.id, resolvedLocale, resolvedTheme, selectResource]
   );
 
   useEffect(() => {
@@ -2530,6 +2602,15 @@ const RichEditorModal = ({
             setDirty(true);
           }}
           visible={notebookPickerOpen}
+        />
+        <MobileResourceActions
+          canMutate={Boolean(memo && !memo.id.startsWith("local:"))}
+          onClose={() => setResourceTarget(null)}
+          onDelete={deleteResource}
+          onDownload={downloadResource}
+          onRename={renameResource}
+          onSaveAs={saveResourceAs}
+          target={resourceTarget}
         />
     </SafeAreaView>
   );
