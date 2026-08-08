@@ -39,6 +39,7 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          token: ${{ secrets.EDGE_EVER_SYNC_TOKEN }}
 
       - name: Require a GitHub Fork
         shell: bash
