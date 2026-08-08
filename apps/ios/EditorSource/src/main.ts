@@ -1,0 +1,985 @@
+import "./styles.css";
+import { Editor, mergeAttributes, Node } from "@tiptap/core";
+import StarterKit from "@tiptap/starter-kit";
+import Image from "@tiptap/extension-image";
+import Placeholder from "@tiptap/extension-placeholder";
+import CodeBlock from "@tiptap/extension-code-block";
+import { TableKit } from "@tiptap/extension-table";
+import { Markdown } from "@tiptap/markdown";
+import { NodeSelection } from "@tiptap/pm/state";
+import mermaid from "mermaid";
+
+/** Keep in sync with packages/shared MergeDivider (iOS bundle cannot import monorepo shared). */
+const MergeDivider = Node.create({
+  name: "edgeeverMergeDivider",
+  group: "block",
+  atom: true,
+  selectable: true,
+  draggable: true,
+  parseHTML() {
+    return [{ tag: "hr[data-edgeever-merge-divider]" }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return [
+      "hr",
+      mergeAttributes(HTMLAttributes, {
+        "data-edgeever-merge-divider": "true",
+        class: "edgeever-merge-divider",
+      }),
+    ];
+  },
+});
+
+type BridgeMessage =
+  | { type: "ready"; startupMs: number }
+  | { type: "change"; contentMarkdown: string; contentJson: string }
+  | { type: "loadResource"; requestId: string; source: string }
+  | { type: "resourcePress"; targetJson: string }
+  | { type: "imagePreview"; source: string; alt: string }
+  | { type: "activeFlags"; flags: number }
+  | { type: "log"; message: string }
+  | { type: "error"; message: string };
+
+/** Match shared `getResourceIdFromUrl` — never return bare `blob`. */
+function getResourceIdFromHref(href: string): string | null {
+  try {
+    const parsed = new URL(href, "http://edgeever.local");
+    const match = parsed.pathname.match(/^\/api\/v1\/resources\/([^/]+)(?:\/blob)?\/?$/);
+    if (match?.[1]) return decodeURIComponent(match[1]);
+  } catch {
+    /* ignore */
+  }
+  const loose = href.match(/\/api\/v1\/resources\/([^/?#]+)/);
+  if (loose?.[1] && loose[1] !== "blob") return decodeURIComponent(loose[1]);
+  return null;
+}
+
+function normalizeResourceHref(href: string, resourceId: string): string {
+  if (/\/blob(?:$|[?#])/.test(href) || href.includes(`/resources/${resourceId}/blob`)) return href;
+  if (href.startsWith("/api/v1/resources/") || href.includes("/api/v1/resources/")) {
+    return `/api/v1/resources/${encodeURIComponent(resourceId)}/blob`;
+  }
+  return href;
+}
+
+function buildImageTargetJson(src: string, filename: string): string | null {
+  const resourceId = getResourceIdFromHref(src);
+  if (!resourceId) return null;
+  return JSON.stringify({
+    kind: "image",
+    href: normalizeResourceHref(src, resourceId),
+    filename: filename.trim() || `image-${resourceId}`,
+    resourceId,
+  });
+}
+
+function buildAttachmentTargetJson(href: string, label: string): string | null {
+  const resourceId = getResourceIdFromHref(href);
+  if (!resourceId) return null;
+  const filename =
+    label.replace(/^\s*(?:附件[：:]|Attachment:)\s*/i, "").trim() || resourceId;
+  return JSON.stringify({
+    kind: "attachment",
+    href: normalizeResourceHref(href, resourceId),
+    filename,
+    resourceId,
+  });
+}
+
+type ConfigureOptions = {
+  mode?: "viewer" | "editor";
+  locale?: string;
+  theme?: "light" | "dark";
+  placeholder?: string;
+};
+
+const startedAt = performance.now();
+let mode: "viewer" | "editor" = "viewer";
+let suppressChange = false;
+const resourceResolvers = new Map<string, (dataUrl: string | null) => void>();
+let resourceSeq = 0;
+
+function post(msg: BridgeMessage) {
+  try {
+    (window as unknown as { webkit?: { messageHandlers?: { edgeever?: { postMessage: (m: unknown) => void } } } })
+      .webkit?.messageHandlers?.edgeever?.postMessage(msg);
+  } catch {
+    // native host unavailable (browser preview)
+  }
+}
+
+function isProtectedResource(src: string): boolean {
+  return src.startsWith("/api/") || src.includes("/api/v1/resources/");
+}
+
+/** file:// editor pages often cannot load remote/protected img srcs; native must rewrite them. */
+function needsNativeHydration(src: string): boolean {
+  if (!src || src.startsWith("data:") || src.startsWith("blob:") || src.startsWith("edgeever-res:")) {
+    return false;
+  }
+  // Protected API paths always need auth + rewrite.
+  if (isProtectedResource(src)) return true;
+  // Absolute remote images also need rewrite under file:// packaging.
+  if (src.startsWith("http://") || src.startsWith("https://")) return true;
+  // Root-relative non-api assets resolved via native base URL.
+  if (src.startsWith("/")) return true;
+  return false;
+}
+
+function requestResource(source: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const requestId = `r${++resourceSeq}`;
+    resourceResolvers.set(requestId, resolve);
+    post({ type: "loadResource", requestId, source });
+    // Timeout so broken resources don't hang forever.
+    setTimeout(() => {
+      if (resourceResolvers.delete(requestId)) resolve(null);
+    }, 30_000);
+  });
+}
+
+async function hydrateProtectedImages(root: HTMLElement) {
+  const images = Array.from(root.querySelectorAll<HTMLImageElement>("img[src]"));
+  await Promise.all(
+    images.map(async (img) => {
+      const src = img.getAttribute("src") || "";
+      if (!needsNativeHydration(src)) return;
+      if (!img.dataset.originalSrc) img.dataset.originalSrc = src;
+      // Avoid re-requesting while a previous hydrate is in flight for the same original.
+      if (img.dataset.hydrating === "1") return;
+      img.dataset.hydrating = "1";
+      try {
+        const dataUrl = await requestResource(src);
+        if (dataUrl) img.setAttribute("src", dataUrl);
+      } finally {
+        delete img.dataset.hydrating;
+      }
+    })
+  );
+}
+
+async function renderMermaidBlocks(root: HTMLElement, theme: "light" | "dark") {
+  const codeBlocks = Array.from(root.querySelectorAll("pre code.language-mermaid, pre code[class*='mermaid']"));
+  // Also treat fenced mermaid paragraphs produced as codeBlock with language attr via data
+  const preBlocks = Array.from(root.querySelectorAll("pre")).filter((pre) => {
+    const text = pre.textContent || "";
+    return pre.querySelector("code") && /^(graph|sequenceDiagram|classDiagram|stateDiagram|erDiagram|journey|gantt|pie|mindmap|flowchart)/m.test(text.trim());
+  });
+
+  const targets = new Set([...codeBlocks.map((c) => c.parentElement!).filter(Boolean), ...preBlocks]);
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: "strict",
+    theme: theme === "dark" ? "dark" : "default",
+  });
+
+  let i = 0;
+  for (const pre of targets) {
+    const source = (pre.textContent || "").trim();
+    if (!source) continue;
+    try {
+      const id = `mmd-${Date.now()}-${i++}`;
+      const { svg } = await mermaid.render(id, source);
+      const wrap = document.createElement("div");
+      wrap.className = "edgeever-mermaid";
+      wrap.innerHTML = svg;
+      pre.replaceWith(wrap);
+    } catch {
+      // leave code block as-is
+    }
+  }
+}
+
+const IMAGE_WIDTH_PRESETS = [
+  { label: "25%", width: 25 },
+  { label: "50%", width: 50 },
+  { label: "75%", width: 75 },
+  { label: "100%", width: 100 },
+] as const;
+
+function parseImageWidth(raw: unknown): number | null {
+  if (raw == null || raw === "") return null;
+  const n = typeof raw === "number" ? raw : Number.parseFloat(String(raw).replace("%", ""));
+  if (!Number.isFinite(n)) return null;
+  return Math.min(100, Math.max(10, Math.round(n)));
+}
+
+function clampImageWidth(n: number): number {
+  return Math.min(100, Math.max(10, Math.round(n)));
+}
+
+/**
+ * Image width is a % of the editor content column.
+ * Apply to the figure itself (not only the <img>) so the layout box shrinks
+ * with the picture — otherwise WKWebView keeps a full-width slot and paints
+ * a pale selection wash in the empty half.
+ */
+function applyFigureWidth(el: HTMLElement, width: number | null) {
+  const w = width == null ? null : clampImageWidth(width);
+  if (w == null) {
+    el.style.removeProperty("width");
+    el.style.removeProperty("max-width");
+    el.style.removeProperty("--ee-image-width");
+    delete el.dataset.width;
+    el.classList.remove("has-width");
+    return;
+  }
+  const pct = `${w}%`;
+  el.dataset.width = String(w);
+  el.classList.add("has-width");
+  el.style.setProperty("--ee-image-width", pct);
+  // Inline styles beat any generic img/figure rules; max-width keeps us inside the column.
+  el.style.setProperty("width", pct);
+  el.style.setProperty("max-width", pct);
+  el.style.setProperty("margin-left", "auto");
+  el.style.setProperty("margin-right", "auto");
+  el.style.setProperty("box-sizing", "border-box");
+  el.style.setProperty("display", "block");
+}
+
+/**
+ * iOS WKWebView + ProseMirror: control taps must:
+ * 1) preventDefault on pointerdown so PM does not steal NodeSelection
+ * 2) run the action on pointerup (click is suppressed after preventDefault)
+ * Desktop still gets a debounced click fallback.
+ */
+function bindImageControlTap(el: HTMLElement, action: () => void) {
+  let lastRun = 0;
+  const block = (event: Event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === "function") {
+      event.stopImmediatePropagation();
+    }
+  };
+  const run = (event: Event) => {
+    block(event);
+    const now = Date.now();
+    if (now - lastRun < 350) return;
+    lastRun = now;
+    action();
+  };
+  el.addEventListener("pointerdown", block);
+  el.addEventListener("mousedown", block);
+  el.addEventListener("touchstart", block, { passive: false });
+  el.addEventListener("pointerup", run);
+  el.addEventListener("click", run);
+}
+
+/**
+ * Android LocalTiptapEditor image node parity:
+ * - figure wrapper + ⋯ action button
+ * - viewer: tap image → fullscreen preview; ⋯ → resource sheet
+ * - editor: tap image → select + show width bar (25/50/75/100%); ⋯ → resource sheet
+ */
+function createEdgeEverImageExtension() {
+  return Image.extend({
+    addAttributes() {
+      return {
+        ...this.parent?.(),
+        width: {
+          default: null,
+          parseHTML: (element) =>
+            parseImageWidth(
+              element.getAttribute("data-width") ?? element.getAttribute("width") ?? (element as HTMLElement).style.width
+            ),
+          renderHTML: (attributes) => {
+            const width = parseImageWidth(attributes.width);
+            return width ? { "data-width": String(width), style: `width: ${width}%` } : {};
+          },
+        },
+      };
+    },
+    addNodeView() {
+      return ({ editor: ed, getPos, node }) => {
+        let currentNode = node;
+        const wrapper = document.createElement("figure");
+        wrapper.className = "edgeever-image-node is-loading";
+        wrapper.contentEditable = "false";
+        wrapper.setAttribute("role", "img");
+
+        const loading = document.createElement("div");
+        loading.className = "edgeever-image-loading";
+        const spinner = document.createElement("span");
+        spinner.className = "edgeever-image-upload-spinner";
+        loading.append(spinner);
+
+        const image = document.createElement("img");
+        image.draggable = false;
+        image.hidden = true;
+
+        const actionButton = document.createElement("button");
+        actionButton.type = "button";
+        actionButton.className = "edgeever-image-actions";
+        actionButton.contentEditable = "false";
+        actionButton.hidden = true;
+        actionButton.setAttribute("aria-label", "图片操作");
+        actionButton.textContent = "⋯";
+
+        const sizeControls = document.createElement("div");
+        sizeControls.className = "edgeever-image-size-controls";
+        sizeControls.contentEditable = "false";
+        sizeControls.hidden = true;
+        sizeControls.setAttribute("role", "group");
+        sizeControls.setAttribute("aria-label", "图片宽度");
+
+        const applyWidthAtPos = (width: number) => {
+          const pos = getPos();
+          if (typeof pos !== "number") return;
+          const n = ed.state.doc.nodeAt(pos);
+          if (!n || n.type.name !== "image") return;
+          const nextWidth = clampImageWidth(width);
+          // Avoid chain().focus() — iOS WKWebView often drops NodeSelection mid-gesture.
+          let tr = ed.state.tr.setNodeMarkup(pos, undefined, {
+            ...n.attrs,
+            width: nextWidth,
+          });
+          try {
+            tr = tr.setSelection(NodeSelection.create(tr.doc, pos));
+          } catch {
+            /* keep markup update even if selection fails */
+          }
+          ed.view.dispatch(tr);
+          applyFigureWidth(wrapper, nextWidth);
+          setActiveWidth(nextWidth);
+        };
+
+        const sizeButtons: Array<{ button: HTMLButtonElement; width: number }> = [];
+        for (const preset of IMAGE_WIDTH_PRESETS) {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "edgeever-image-size-button";
+          btn.textContent = preset.label;
+          btn.setAttribute("aria-label", preset.label);
+          btn.setAttribute("aria-pressed", "false");
+          bindImageControlTap(btn, () => applyWidthAtPos(preset.width));
+          sizeButtons.push({ button: btn, width: preset.width });
+          sizeControls.append(btn);
+        }
+
+        const setActiveWidth = (width: number | null) => {
+          for (const item of sizeButtons) {
+            const active = width != null && item.width === width;
+            item.button.classList.toggle("is-active", active);
+            item.button.setAttribute("aria-pressed", String(active));
+          }
+        };
+
+        const setPhase = (phase: "loading" | "ready" | "failed") => {
+          wrapper.classList.toggle("is-loading", phase === "loading");
+          wrapper.classList.toggle("is-failed", phase === "failed");
+          loading.hidden = phase === "ready";
+          image.hidden = phase !== "ready";
+          actionButton.hidden = phase !== "ready";
+          if (phase === "failed") {
+            loading.replaceChildren();
+            const label = document.createElement("span");
+            label.className = "edgeever-image-loading-label";
+            label.textContent = "图片加载失败";
+            loading.append(label);
+            loading.hidden = false;
+          } else if (phase === "loading") {
+            loading.replaceChildren(spinner);
+          }
+        };
+
+        const resourceHrefFromAttrs = (attrs: Record<string, unknown>) => {
+          const src = String(attrs.src ?? "");
+          // Prefer protected API path over display data:/edgeever-res:
+          if (isProtectedResource(src) || getResourceIdFromHref(src)) return src;
+          return wrapper.dataset.resourceHref || src;
+        };
+
+        const emitActions = () => {
+          const href =
+            wrapper.dataset.resourceHref ||
+            image.dataset.originalSrc ||
+            resourceHrefFromAttrs(currentNode.attrs as Record<string, unknown>);
+          const json = buildImageTargetJson(href, String(currentNode.attrs.alt ?? "image"));
+          if (json) {
+            post({ type: "resourcePress", targetJson: json });
+            return;
+          }
+          // Still notify native with best-effort payload when id parse fails.
+          post({
+            type: "log",
+            message: `image actions: no resource id for href=${href.slice(0, 120)}`,
+          });
+        };
+
+        const emitPreview = () => {
+          const href =
+            wrapper.dataset.resourceHref ||
+            image.dataset.originalSrc ||
+            resourceHrefFromAttrs(currentNode.attrs as Record<string, unknown>) ||
+            image.getAttribute("src") ||
+            "";
+          if (!href) return;
+          post({
+            type: "imagePreview",
+            source: href,
+            alt: String(currentNode.attrs.alt ?? ""),
+          });
+        };
+
+        bindImageControlTap(actionButton, emitActions);
+
+        // Android parity:
+        // - viewer: tap image → fullscreen preview
+        // - editor: tap image → select node (shows 25/50/75/100% width bar); ⋯ → action sheet
+        // Image body: only stopPropagation on pointerdown (keeps scroll working).
+        let lastImageActivate = 0;
+        const onImageActivate = (event: Event) => {
+          if (event.target instanceof Element && event.target.closest(".edgeever-image-actions")) {
+            return;
+          }
+          const now = Date.now();
+          if (now - lastImageActivate < 350) return;
+          lastImageActivate = now;
+          event.stopPropagation();
+          if (mode === "viewer" || !ed.isEditable) {
+            event.preventDefault();
+            emitPreview();
+            return;
+          }
+          event.preventDefault();
+          const pos = getPos();
+          if (typeof pos === "number") {
+            ed.chain().setNodeSelection(pos).run();
+          }
+        };
+        image.addEventListener("pointerdown", (event) => event.stopPropagation());
+        image.addEventListener("click", onImageActivate);
+        image.addEventListener("pointerup", (event) => {
+          // iOS sometimes skips click after PM handles pointer; activate on short taps.
+          if (event.pointerType === "touch" || event.pointerType === "pen") {
+            onImageActivate(event);
+          }
+        });
+
+        wrapper.append(loading, image, actionButton, sizeControls);
+
+        let requestId = 0;
+        let renderedSource = "";
+        let selected = false;
+
+        const applyMeta = (attrs: Record<string, unknown>) => {
+          const alt = String(attrs.alt ?? "");
+          image.alt = alt;
+          const width = parseImageWidth(attrs.width);
+          applyFigureWidth(wrapper, width);
+          setActiveWidth(width);
+          const src = String(attrs.src ?? "");
+          const rid = getResourceIdFromHref(src);
+          if (rid) {
+            wrapper.dataset.resourceHref = normalizeResourceHref(src, rid);
+            image.dataset.originalSrc = wrapper.dataset.resourceHref;
+          }
+        };
+
+        const loadImage = (attrs: Record<string, unknown>) => {
+          requestId += 1;
+          const active = requestId;
+          const src = String(attrs.src ?? "");
+          renderedSource = src;
+          applyMeta(attrs);
+          setPhase("loading");
+          sizeControls.hidden = true;
+
+          const finish = (display: string) => {
+            if (active !== requestId) return;
+            image.onload = () => {
+              if (active !== requestId) return;
+              setPhase("ready");
+              image.style.cursor = mode === "viewer" || !ed.isEditable ? "zoom-in" : "pointer";
+              if (selected && ed.isEditable && mode === "editor") {
+                sizeControls.hidden = false;
+              }
+            };
+            image.onerror = () => {
+              if (active !== requestId) return;
+              setPhase("failed");
+            };
+            image.src = display;
+          };
+
+          if (!src) {
+            setPhase("failed");
+            return;
+          }
+          if (src.startsWith("data:") || src.startsWith("edgeever-res:") || src.startsWith("blob:")) {
+            finish(src);
+            return;
+          }
+          if (needsNativeHydration(src)) {
+            void requestResource(src).then((dataUrl) => {
+              if (active !== requestId) return;
+              if (dataUrl) finish(dataUrl);
+              else setPhase("failed");
+            });
+            return;
+          }
+          finish(src);
+        };
+
+        loadImage(node.attrs as Record<string, unknown>);
+
+        return {
+          dom: wrapper,
+          update: (updated) => {
+            if (updated.type.name !== "image") return false;
+            currentNode = updated;
+            const nextSrc = String(updated.attrs.src ?? "");
+            applyMeta(updated.attrs as Record<string, unknown>);
+            if (nextSrc !== renderedSource) {
+              loadImage(updated.attrs as Record<string, unknown>);
+            } else {
+              setActiveWidth(parseImageWidth(updated.attrs.width));
+              applyFigureWidth(wrapper, parseImageWidth(updated.attrs.width));
+            }
+            return true;
+          },
+          selectNode: () => {
+            selected = true;
+            wrapper.classList.add("is-selected");
+            // Re-assert layout width so selection never leaves a full-width empty slot.
+            const selWidth =
+              parseImageWidth(
+                (ed.state.selection as { node?: { attrs?: { width?: unknown } } }).node?.attrs?.width
+              ) ?? parseImageWidth(wrapper.dataset.width) ?? parseImageWidth(currentNode.attrs.width);
+            applyFigureWidth(wrapper, selWidth);
+            // Width bar only in editor when the image is the active node selection.
+            if (ed.isEditable && mode === "editor" && !image.hidden) {
+              sizeControls.hidden = false;
+              setActiveWidth(selWidth);
+            }
+          },
+          deselectNode: () => {
+            selected = false;
+            wrapper.classList.remove("is-selected");
+            sizeControls.hidden = true;
+          },
+          destroy: () => {
+            requestId += 1;
+          },
+        };
+      };
+    },
+  }).configure({
+    inline: false,
+    allowBase64: true,
+  });
+}
+
+function buildExtensions(placeholder: string) {
+  return [
+    StarterKit.configure({
+      codeBlock: false,
+    }),
+    MergeDivider,
+    CodeBlock.configure({
+      languageClassPrefix: "language-",
+    }),
+    createEdgeEverImageExtension(),
+    TableKit.configure({
+      table: { resizable: false },
+    }),
+    Placeholder.configure({
+      placeholder,
+    }),
+    Markdown.configure({
+      markedOptions: { gfm: true },
+    }),
+  ];
+}
+
+const editorEl = document.getElementById("editor")!;
+const toolbarEl = document.getElementById("toolbar")!;
+
+const editor = new Editor({
+  element: editorEl,
+  extensions: buildExtensions("开始书写…"),
+  editable: false,
+  content: { type: "doc", content: [{ type: "paragraph" }] },
+  onUpdate: ({ editor: ed }) => {
+    if (suppressChange || mode !== "editor") return;
+    emitChange(ed);
+  },
+  editorProps: {
+    attributes: {
+      class: "edgeever-prose",
+      spellcheck: "true",
+    },
+    handleClick(_view, _pos, event) {
+      return handleResourcePointer(event as MouseEvent, "click");
+    },
+    handleDOMEvents: {
+      contextmenu(_view, event) {
+        return handleResourcePointer(event, "contextmenu");
+      },
+    },
+  },
+});
+
+/**
+ * Android parity:
+ * - attachment link → always resource action sheet
+ * - viewer image click → fullscreen preview
+ * - viewer image long-press / contextmenu → resource action sheet
+ * - editor image click inside nodeView → select + width bar (owned by nodeView)
+ * - editor image ⋯ → resource action sheet (owned by nodeView)
+ */
+function handleResourcePointer(event: Event, kind: "click" | "contextmenu"): boolean {
+  const target = event.target as HTMLElement | null;
+  if (!target) return false;
+
+  // Size / ⋯ controls own their gestures — never intercept from PM handleClick.
+  if (
+    target.closest(".edgeever-image-size-controls") ||
+    target.closest(".edgeever-image-actions") ||
+    target.closest(".edgeever-image-size-button")
+  ) {
+    return true;
+  }
+
+  const link = target.closest("a");
+  if (link instanceof HTMLAnchorElement) {
+    const href = link.getAttribute("href") || "";
+    if (isProtectedResource(href) || getResourceIdFromHref(href)) {
+      const json = buildAttachmentTargetJson(href, link.textContent || "");
+      if (json) {
+        event.preventDefault();
+        event.stopPropagation();
+        post({ type: "resourcePress", targetJson: json });
+        return true;
+      }
+    }
+  }
+
+  const img = target.closest("img");
+  if (img instanceof HTMLImageElement) {
+    // Custom image nodeView owns image taps (select/preview/⋯).
+    if (img.closest("figure.edgeever-image-node") && kind === "click") {
+      return false;
+    }
+
+    const src = img.dataset.originalSrc || img.getAttribute("src") || "";
+    const protectedSrc =
+      img.dataset.originalSrc ||
+      (isProtectedResource(src) || getResourceIdFromHref(src) ? src : "");
+    if (!protectedSrc && !getResourceIdFromHref(src)) {
+      // Non-protected image — still allow preview of data: display src in viewer.
+      if (mode === "viewer" && kind === "click" && src) {
+        event.preventDefault();
+        post({
+          type: "imagePreview",
+          source: src,
+          alt: img.getAttribute("alt") || "",
+        });
+        return true;
+      }
+      return false;
+    }
+    const hrefForMenu = protectedSrc || src;
+    const filename = img.getAttribute("alt") || "image";
+
+    // Long-press / context menu → resource actions (editor + viewer).
+    if (kind === "contextmenu") {
+      const json = buildImageTargetJson(hrefForMenu, filename);
+      if (json) {
+        event.preventDefault();
+        event.stopPropagation();
+        post({ type: "resourcePress", targetJson: json });
+        return true;
+      }
+    }
+
+    // Viewer plain tap on bare <img> (no nodeView) → preview.
+    if (mode === "viewer" && kind === "click") {
+      event.preventDefault();
+      event.stopPropagation();
+      post({
+        type: "imagePreview",
+        source: hrefForMenu,
+        alt: filename,
+      });
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Long-press on images (mobile WebView often does not fire contextmenu reliably).
+(() => {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let startImg: HTMLImageElement | null = null;
+  const clear = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    startImg = null;
+  };
+  editorEl.addEventListener(
+    "touchstart",
+    (event) => {
+      const img = (event.target as HTMLElement | null)?.closest("img");
+      if (!(img instanceof HTMLImageElement)) return;
+      startImg = img;
+      timer = setTimeout(() => {
+        if (!startImg) return;
+        const src = startImg.dataset.originalSrc || startImg.getAttribute("src") || "";
+        const json = buildImageTargetJson(src, startImg.getAttribute("alt") || "image");
+        if (json) {
+          post({ type: "resourcePress", targetJson: json });
+        }
+        clear();
+      }, 480);
+    },
+    { passive: true }
+  );
+  editorEl.addEventListener("touchend", clear, { passive: true });
+  editorEl.addEventListener("touchmove", clear, { passive: true });
+  editorEl.addEventListener("touchcancel", clear, { passive: true });
+})();
+
+function emitChange(ed: Editor) {
+  try {
+    const contentJson = JSON.stringify(ed.getJSON());
+    // @tiptap/markdown storage
+    const storage = ed.storage as { markdown?: { getMarkdown?: () => string } };
+    const contentMarkdown =
+      storage.markdown?.getMarkdown?.() ??
+      // fallback: plain text
+      ed.getText({ blockSeparator: "\n\n" });
+    post({ type: "change", contentMarkdown, contentJson });
+  } catch (error) {
+    post({ type: "error", message: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+function setToolbarVisible(visible: boolean) {
+  toolbarEl.classList.toggle("editor-mode", visible);
+  toolbarEl.innerHTML = "";
+  if (!visible) return;
+  const actions: Array<{ id: string; label: string; run: () => void }> = [
+    { id: "bold", label: "B", run: () => editor.chain().focus().toggleBold().run() },
+    {
+      id: "bullet",
+      label: "•",
+      run: () => editor.chain().focus().toggleBulletList().run(),
+    },
+    {
+      id: "quote",
+      label: "❝",
+      run: () => editor.chain().focus().toggleBlockquote().run(),
+    },
+    {
+      id: "hr",
+      label: "—",
+      run: () => editor.chain().focus().setHorizontalRule().run(),
+    },
+    {
+      id: "h2",
+      label: "H2",
+      run: () => editor.chain().focus().toggleHeading({ level: 2 }).run(),
+    },
+    {
+      id: "code",
+      label: "</>",
+      run: () => editor.chain().focus().toggleCodeBlock().run(),
+    },
+  ];
+  for (const action of actions) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = action.label;
+    btn.dataset.action = action.id;
+    btn.addEventListener("click", () => {
+      action.run();
+      emitChange(editor);
+    });
+    toolbarEl.appendChild(btn);
+  }
+}
+
+async function afterContentSet(theme: "light" | "dark" = "light") {
+  await hydrateProtectedImages(editorEl);
+  if (mode === "viewer") {
+    await renderMermaidBlocks(editorEl, theme);
+  }
+}
+
+export type EdgeEverEditorAPI = {
+  configure: (opts: ConfigureOptions) => void;
+  setMarkdown: (md: string) => void;
+  setDocumentFromJSON: (json: string) => void;
+  resolveResource: (requestId: string, dataUrl: string | null) => void;
+  getMarkdown: () => string;
+  getDocument: () => string;
+  focusEnd: () => void;
+  flush: () => void;
+  exec: (actionId: string) => void;
+  beginImageUpload: (uploadId: string, previewDataUrl: string) => void;
+  completeImageUpload: (uploadId: string, imageUrl: string, alt: string) => void;
+  cancelImageUpload: (uploadId: string) => void;
+};
+
+const api: EdgeEverEditorAPI = {
+  configure(opts) {
+    const nextMode = opts.mode === "editor" ? "editor" : "viewer";
+    const modeChanged = nextMode !== mode;
+    mode = nextMode;
+    editor.setEditable(mode === "editor");
+    setToolbarVisible(mode === "editor");
+    document.documentElement.dataset.theme = opts.theme || "light";
+    document.body.classList.toggle("viewer-mode", mode === "viewer");
+    document.body.classList.toggle("editor-mode", mode === "editor");
+    if (opts.placeholder) {
+      // placeholder is extension config; update via meta class
+      editorEl.setAttribute("data-placeholder", opts.placeholder);
+    }
+    // Match Evernote-style edit entry: focus the surface when entering editor mode.
+    // Combined with setContent's default end selection, caret lands at document end.
+    if (mode === "editor" && modeChanged) {
+      requestAnimationFrame(() => {
+        try {
+          editor.commands.focus("end");
+        } catch {
+          /* ignore */
+        }
+      });
+    }
+  },
+
+  setMarkdown(md) {
+    suppressChange = true;
+    try {
+      editor.commands.setContent(md || "", { contentType: "markdown" } as never);
+    } catch {
+      try {
+        const manager = (editor.storage as { markdown?: { manager?: { parse: (s: string) => unknown } } }).markdown
+          ?.manager;
+        if (manager) {
+          editor.commands.setContent(manager.parse(md || "") as never);
+        } else {
+          throw new Error("no markdown manager");
+        }
+      } catch {
+        editor.commands.setContent({
+          type: "doc",
+          content: [{ type: "paragraph", content: md ? [{ type: "text", text: md }] : [] }],
+        });
+      }
+    }
+    // Keep editability. Do NOT focus("end") here — native re-pushes content on SwiftUI
+    // updates while typing; focusing would yank the caret to the document bottom mid-edit.
+    editor.setEditable(mode === "editor");
+    suppressChange = false;
+    void afterContentSet((document.documentElement.dataset.theme as "light" | "dark") || "light");
+  },
+
+  setDocumentFromJSON(json) {
+    suppressChange = true;
+    try {
+      const doc = JSON.parse(json);
+      editor.commands.setContent(doc);
+    } catch {
+      editor.commands.setContent({ type: "doc", content: [{ type: "paragraph" }] });
+    }
+    editor.setEditable(mode === "editor");
+    suppressChange = false;
+    void afterContentSet((document.documentElement.dataset.theme as "light" | "dark") || "light");
+  },
+
+  resolveResource(requestId, dataUrl) {
+    const resolver = resourceResolvers.get(requestId);
+    if (resolver) {
+      resourceResolvers.delete(requestId);
+      resolver(dataUrl);
+    }
+  },
+
+  getMarkdown() {
+    const storage = editor.storage as { markdown?: { getMarkdown?: () => string } };
+    return storage.markdown?.getMarkdown?.() ?? editor.getText({ blockSeparator: "\n\n" });
+  },
+
+  getDocument() {
+    return JSON.stringify(editor.getJSON());
+  },
+
+  focusEnd() {
+    try {
+      editor.commands.focus("end");
+    } catch {
+      /* ignore */
+    }
+    // iOS WKWebView: TipTap selection alone may not move DOM focus to the contenteditable.
+    // Explicitly focus ProseMirror so the software keyboard can attach after native first-responder.
+    try {
+      const dom = editor.view?.dom as HTMLElement | undefined;
+      if (dom && typeof dom.focus === "function") {
+        dom.focus({ preventScroll: true });
+      }
+    } catch {
+      /* ignore */
+    }
+  },
+
+  flush() {
+    emitChange(editor);
+  },
+
+  exec(actionId) {
+    const map: Record<string, () => void> = {
+      bold: () => editor.chain().focus().toggleBold().run(),
+      bulletList: () => editor.chain().focus().toggleBulletList().run(),
+      blockquote: () => editor.chain().focus().toggleBlockquote().run(),
+      horizontalRule: () => editor.chain().focus().setHorizontalRule().run(),
+      heading2: () => editor.chain().focus().toggleHeading({ level: 2 }).run(),
+      codeBlock: () => editor.chain().focus().toggleCodeBlock().run(),
+    };
+    map[actionId]?.();
+    emitChange(editor);
+  },
+
+  beginImageUpload(uploadId, previewDataUrl) {
+    editor
+      .chain()
+      .focus()
+      .setImage({ src: previewDataUrl, alt: uploadId })
+      .run();
+    // mark last image
+    const imgs = editorEl.querySelectorAll("img");
+    const last = imgs[imgs.length - 1] as HTMLImageElement | undefined;
+    if (last) last.dataset.uploadId = uploadId;
+    emitChange(editor);
+  },
+
+  completeImageUpload(uploadId, imageUrl, alt) {
+    // Always mutate ProseMirror via setImage — DOM-only attr writes do not persist.
+    // Native hydrate rewrites display src under file:// after emitChange.
+    editor
+      .chain()
+      .focus()
+      .setImage({ src: imageUrl, alt: alt || uploadId || "" })
+      .run();
+    const imgs = editorEl.querySelectorAll("img");
+    const last = imgs[imgs.length - 1] as HTMLImageElement | undefined;
+    if (last) {
+      last.dataset.originalSrc = imageUrl;
+      delete last.dataset.uploadId;
+    }
+    emitChange(editor);
+  },
+
+  cancelImageUpload(uploadId) {
+    const img = editorEl.querySelector(`img[data-upload-id="${uploadId}"]`);
+    img?.remove();
+    emitChange(editor);
+  },
+};
+
+(window as unknown as { EdgeEverEditor: EdgeEverEditorAPI }).EdgeEverEditor = api;
+setToolbarVisible(false);
+post({ type: "ready", startupMs: Math.round(performance.now() - startedAt) });
